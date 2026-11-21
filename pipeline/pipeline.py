@@ -6,6 +6,7 @@ Reads  $DATA_DIR    (default /data)
 Writes $OUTPUT_DIR  (default /output): user_daily/ and campaign_daily/ as Parquet
 Temp   $SCRATCH_DIR (default /scratch)
 """
+import glob
 import json
 import os
 
@@ -20,8 +21,8 @@ MEM_GB = int(os.environ.get("MEM_GB", "8"))
 MS_DAY = 86_400_000
 MS_WEEK = 7 * MS_DAY
 GAP_MS = 30 * 60 * 1000
-# Delimiter that never occurs in the data. We read each line as one column
-# and split on ',' ourselves, so DuckDB's own CSV rules never apply.
+# Delimiter that never occurs in the data. Each line is read as one column
+# and split on ',' here, so DuckDB's CSV rules never apply.
 SEP = chr(31)
 FIELD_OK = r'"[^"]*"|[^"]*'  # a whole quoted field, or a bare field with no quote
 
@@ -34,7 +35,6 @@ con.execute("SET TimeZone = 'UTC'")
 
 # ---------------------------------------------------------------- timestamps
 # F1 (Z), F2 (+HH:MM / -HH:MM) and F3 (digits = epoch ms). Returns NULL if bad.
-# Every digit extraction uses TRY_CAST, so a non-digit can never raise an error.
 con.execute(r"""
 CREATE OR REPLACE MACRO ts_ms(s) AS (
   CASE
@@ -60,10 +60,11 @@ CREATE OR REPLACE MACRO ts_ms(s) AS (
 );
 """)
 
+
 # ---------------------------------------------------------------- parsing
 def raw_lines(path, skip):
-    """One row per physical line: (line, n), where n is the 1-based line number in its file.
-    The CSV reader is never used, so no CSV rules apply here."""
+    """One row per physical line, split on '\\n' only. read_text keeps every byte,
+    so a '\\r' stays in its field as rules.md requires."""
     return f"""(
         SELECT r.line, r.n FROM (
             SELECT unnest(list_transform(
@@ -76,6 +77,10 @@ def raw_lines(path, skip):
 
 
 def parsed(path, nfields, skip=1):
+    """Rows of unquoted fields for well-formed lines. Empty field -> NULL.
+    A glob that matches no files yields an empty result."""
+    if "*" in path and not glob.glob(path):
+        return "SELECT CAST(NULL AS VARCHAR[]) AS f WHERE false"
     return f"""
         SELECT list_transform(p, x -> NULLIF(
                    CASE WHEN x LIKE '"%"' THEN substr(x, 2, length(x) - 2) ELSE x END, ''
@@ -90,7 +95,6 @@ with open(os.path.join(DATA, "manifest.json")) as f:
     manifest = json.load(f)
 WS = con.execute("SELECT ts_ms(?)", [manifest["window_start"]]).fetchone()[0]
 WE = con.execute("SELECT ts_ms(?)", [manifest["window_end"]]).fetchone()[0]
-print("window (ms):", WS, WE)
 
 # ---------------------------------------------------------------- small tables
 con.execute(f"""
@@ -115,39 +119,69 @@ FROM ({parsed(os.path.join(DATA, 'links', '*.csv'), 2)})
 WHERE f[1] IS NOT NULL AND f[2] IS NOT NULL
 """)
 
-con.execute("""
-CREATE TABLE edges AS
-SELECT a AS u, b AS v FROM lk
-UNION ALL
-SELECT b AS u, a AS v FROM lk
-""")
-con.execute("CREATE TABLE lab AS SELECT DISTINCT u AS id, u AS lab FROM edges")
 
-# Connected components by min-label propagation with pointer jumping.
-# Labels only decrease, and a fixed point assigns every component its byte-wise
-# minimum ID. VARCHAR comparison is byte-wise in DuckDB's default collation.
-while True:
+def link_components():
+    """Hook-and-compress connected components over the edge table.
+    Invariants: lab[x] <= x, and lab[x] is in x's component. Labels only decrease.
+    At a fixed point every edge has equal labels, so each component's label is
+    its byte-wise minimum ID."""
     con.execute("""
-        CREATE OR REPLACE TABLE lab_next AS
-        WITH nb AS (
-            SELECT e.u AS id, min(l.lab) AS nmin
-            FROM edges e JOIN lab l ON l.id = e.v
-            GROUP BY e.u
-        ),
-        m AS (
-            SELECT l.id, least(l.lab, coalesce(nb.nmin, l.lab)) AS m
-            FROM lab l LEFT JOIN nb ON nb.id = l.id
-        )
-        SELECT m.id, least(m.m, coalesce(l2.lab, m.m)) AS lab
-        FROM m LEFT JOIN lab l2 ON l2.id = m.m
+        CREATE TABLE edges AS
+        SELECT a AS u, b AS v FROM lk
+        UNION ALL
+        SELECT b AS u, a AS v FROM lk
     """)
-    changed = con.execute(
-        "SELECT count(*) FROM lab_next n JOIN lab o USING (id) WHERE n.lab <> o.lab"
-    ).fetchone()[0]
-    con.execute("DROP TABLE lab")
-    con.execute("ALTER TABLE lab_next RENAME TO lab")
-    if changed == 0:
-        break
+    con.execute("CREATE TABLE lab AS SELECT DISTINCT u AS id, u AS lab FROM edges")
+
+    while True:
+        # Hook: each root takes the smallest neighbouring root below it.
+        con.execute("""
+            CREATE OR REPLACE TABLE hook AS
+            SELECT lu.lab AS id, min(lv.lab) AS cand
+            FROM edges e
+            JOIN lab lu ON lu.id = e.u
+            JOIN lab lv ON lv.id = e.v
+            WHERE lv.lab < lu.lab
+            GROUP BY lu.lab
+        """)
+        con.execute("""
+            CREATE OR REPLACE TABLE lab_next AS
+            SELECT l.id,
+                   CASE WHEN l.id = l.lab AND h.cand IS NOT NULL
+                        THEN least(l.lab, h.cand) ELSE l.lab END AS lab
+            FROM lab l LEFT JOIN hook h ON h.id = l.lab
+        """)
+        con.execute("DROP TABLE lab")
+        con.execute("ALTER TABLE lab_next RENAME TO lab")
+
+        # Compress: lab[x] = lab[lab[x]] until nothing moves.
+        while True:
+            con.execute("""
+                CREATE OR REPLACE TABLE lab_next AS
+                SELECT l.id, least(l.lab, coalesce(p.lab, l.lab)) AS lab
+                FROM lab l LEFT JOIN lab p ON p.id = l.lab
+            """)
+            moved = con.execute(
+                "SELECT count(*) FROM lab_next n JOIN lab o USING (id) WHERE n.lab <> o.lab"
+            ).fetchone()[0]
+            con.execute("DROP TABLE lab")
+            con.execute("ALTER TABLE lab_next RENAME TO lab")
+            if moved == 0:
+                break
+
+        # Done when every edge joins two IDs with the same label.
+        unresolved = con.execute("""
+            SELECT count(*) FROM edges e
+            JOIN lab a ON a.id = e.u
+            JOIN lab b ON b.id = e.v
+            WHERE a.lab <> b.lab
+        """).fetchone()[0]
+        con.execute("DROP TABLE hook")
+        if unresolved == 0:
+            break
+
+
+link_components()
 
 # ---------------------------------------------------------------- events
 con.execute(f"""
@@ -295,7 +329,8 @@ FROM sess_agg s
 ASOF LEFT JOIN cl_pt c ON s.pid = c.pid AND s.start_ts >= c.ts
 """)
 
-# Assists: a campaign assists a session if one of the person's clicks has
+# ---------------------------------------------------------------- assists
+# A campaign assists a session if one of the person's clicks has
 # click.ts in [start - 7d, start], i.e. start in [click.ts, click.ts + 7d].
 # Per (person, campaign), merge those intervals into islands, then join once.
 con.execute(f"""
@@ -389,12 +424,3 @@ COPY (
     LEFT JOIN campaigns k ON k.campaign_id = m.campaign_id
 ) TO '{os.path.join(OUT, "campaign_daily", "part-0.parquet")}' (FORMAT parquet)
 """)
-
-# ---------------------------------------------------------------- self-check
-ud = con.execute(f"SELECT sum(sessions), sum(revenue_cents) FROM read_parquet('{OUT}/user_daily/*.parquet')").fetchone()
-cd = con.execute(f"SELECT sum(sessions), sum(revenue_cents), sum(assisted_sessions) FROM read_parquet('{OUT}/campaign_daily/*.parquet')").fetchone()
-print("user_daily sessions/revenue:", ud)
-print("campaign_daily sessions/revenue/assisted:", cd)
-if ud[0] != cd[0] or ud[1] != cd[1]:
-    print("WARNING: sessions or revenue do not match across tables")
-print("done")
