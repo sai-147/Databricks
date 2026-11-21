@@ -1,0 +1,9 @@
+.venv/
+dev/
+out/
+scratch_dev/
+dev-answer
+__pycache__/
+*.pyc
+*:Zone.Identifier
+*Zone.Identifier*
